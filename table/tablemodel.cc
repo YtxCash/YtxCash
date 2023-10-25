@@ -1,145 +1,164 @@
 #include "tablemodel.h"
-#include "../globalmanager/sqlconnectionpool.h"
-#include "../globalmanager/transactionpool.h"
-#include <QDebug>
-#include <QSqlError>
-#include <QSqlQuery>
 
-TableModel::TableModel(const TableInfo& info, QObject* parent)
+#include "global/transpool.h"
+
+TableModel::TableModel(const TableInfo* info, TableSql* sql, const Interface* interface, int node_id, bool node_rule, QObject* parent)
     : QAbstractItemModel { parent }
-    , db_ { SqlConnectionPool::Instance().Allocate() }
-    , table_info_ { info }
+    , info_ { info }
+    , sql_ { sql }
+    , interface_ { interface }
+    , node_id_ { node_id }
+    , node_rule_ { node_rule }
 {
-
-    header_ << "ID"
-            << "Date"
-            << "Description"
-            << "Transfor"
-            << "S"
-            << "D"
-            << "Debit"
-            << "Credit"
-            << "Balance";
-
-    CreateTable(info.node_id, transaction_list_);
-    AccumulateBalance(transaction_list_, 0, table_info_.node_rule);
+    sql_->Table(trans_list_, node_id);
+    AccumulateBalance(trans_list_, 0, node_rule);
 }
 
-TableModel::~TableModel()
-{
-    RemoveEmptyTransfer(transaction_list_);
-    SqlConnectionPool::Instance().Recycle(db_);
-    RecycleTransaction(transaction_list_);
-}
+TableModel::~TableModel() { RecycleTrans(trans_list_); }
 
-void TableModel::ReceiveRule(int node_id, bool rule)
+void TableModel::RNodeRule(int node_id, bool node_rule)
 {
-    if (table_info_.node_id != node_id || table_info_.node_rule == rule)
+    if (node_id_ != node_id || node_rule_ == node_rule)
         return;
 
-    table_info_.node_rule = rule;
-    AccumulateBalance(transaction_list_, 0, table_info_.node_rule);
+    for (auto& trans : trans_list_)
+        trans->balance = -trans->balance;
+
+    node_rule_ = node_rule;
+
+    emit SResizeColumnToContents(static_cast<int>(TableColumn::kBalance));
 }
 
-void TableModel::ReceiveUpdate(const Transaction& transaction)
+void TableModel::RUpdateTrans(CSPCTrans& trans, TableColumn column)
 {
-    if (table_info_.node_id != transaction.transfer)
+    if (node_id_ != trans->rhs_node)
         return;
 
-    int row = GetRow(transaction.id);
+    int row { TransRow(trans->id) };
     if (row == -1)
         return;
 
-    auto old_transaction = transaction_list_.at(row);
+    auto old_trans { trans_list_.at(row) };
 
-    bool des_changed = old_transaction->description != transaction.description;
-    bool deb_cre_changed = old_transaction->debit != transaction.credit || old_transaction->credit != transaction.debit;
-    bool pos_changed = old_transaction->post_date != transaction.post_date;
-    bool sta_changed = old_transaction->status != transaction.status;
-    bool doc_changed = old_transaction->document != transaction.document;
-
-    if (des_changed)
-        old_transaction->description = transaction.description;
-
-    if (pos_changed)
-        old_transaction->post_date = transaction.post_date;
-
-    if (deb_cre_changed) {
-        old_transaction->debit = transaction.credit;
-        old_transaction->credit = transaction.debit;
-        AccumulateBalance(transaction_list_, row, table_info_.node_rule);
+    switch (column) {
+    case TableColumn::kPostDate:
+        old_trans->post_date = trans->post_date;
+        break;
+    case TableColumn::kCode:
+        old_trans->code = trans->code;
+        break;
+    case TableColumn::kDescription:
+        old_trans->description = trans->description;
+        break;
+    case TableColumn::kState:
+        old_trans->state = trans->state;
+        break;
+    case TableColumn::kDocument:
+        old_trans->document = trans->document;
+        break;
+    case TableColumn::kLhsRate:
+        old_trans->rhs_rate = trans->lhs_rate;
+    case TableColumn::kDebit: {
+        old_trans->debit = trans->credit * trans->lhs_rate / old_trans->lhs_rate;
+        old_trans->credit = trans->debit * trans->lhs_rate / old_trans->lhs_rate;
+        AccumulateBalance(trans_list_, row, node_rule_);
+        break;
     }
-
-    if (sta_changed)
-        old_transaction->status = transaction.status;
-
-    if (doc_changed)
-        old_transaction->document = transaction.document;
+    default:
+        break;
+    }
 }
 
-void TableModel::ReceiveRemove(int node_id, int trans_id)
+void TableModel::RAppendTrans(CSPCTrans& trans)
 {
-    if (table_info_.node_id != node_id)
+    if (node_id_ != trans->rhs_node)
         return;
 
-    int row = GetRow(trans_id);
-    if (row == -1)
-        return;
+    auto new_trans { TransPool::Instance().Allocate() };
+    new_trans->post_date = trans->post_date;
+    new_trans->id = trans->id;
+    new_trans->description = trans->description;
+    new_trans->code = trans->code;
+    new_trans->document = trans->document;
+    new_trans->state = trans->state;
 
-    beginRemoveRows(QModelIndex(), row, row);
-    auto transaction = transaction_list_.takeAt(row);
-    endRemoveRows();
+    new_trans->rhs_rate = trans->lhs_rate;
+    new_trans->debit = trans->credit * trans->lhs_rate / new_trans->lhs_rate;
+    new_trans->credit = trans->debit * trans->lhs_rate / new_trans->lhs_rate;
+    new_trans->rhs_node = trans->lhs_node;
+    new_trans->lhs_node = trans->rhs_node;
 
-    AccumulateBalance(transaction_list_, row, table_info_.node_rule);
-
-    TransactionPool::Instance().Recycle(transaction);
-}
-
-void TableModel::ReceiveCopy(int node_id, const Transaction& transaction)
-{
-    if (table_info_.node_id != transaction.transfer)
-        return;
-
-    auto new_transaction = TransactionPool::Instance().Allocate();
-    new_transaction->post_date = transaction.post_date;
-    new_transaction->id = transaction.id;
-    new_transaction->description = transaction.description;
-    new_transaction->debit = transaction.credit;
-    new_transaction->credit = transaction.debit;
-    new_transaction->transfer = node_id;
-
-    int row = transaction_list_.size() - 1;
+    auto row { trans_list_.size() };
 
     beginInsertRows(QModelIndex(), row, row);
-    transaction_list_.emplaceBack(new_transaction);
+    trans_list_.emplaceBack(new_trans);
     endInsertRows();
 
-    AccumulateBalance(transaction_list_, row, table_info_.node_rule);
+    double previous_balance { row >= 1 ? trans_list_.at(row - 1)->balance : 0.0 };
+    new_trans->balance = CalculateBalance(node_rule_, new_trans->debit, new_trans->credit) + previous_balance;
 }
 
-void TableModel::ReceiveReload(int node_id)
+void TableModel::RRemoveTrans(const QMultiHash<int, int>& node_trans)
 {
-    if (table_info_.node_id != node_id)
+    if (!node_trans.contains(node_id_))
         return;
 
-    RecycleTransaction(transaction_list_);
-
-    beginResetModel();
-    CreateTable(node_id, transaction_list_);
-    endResetModel();
+    auto trans_list { node_trans.values(node_id_) };
+    RemoveRows(trans_list);
 }
 
-void TableModel::ReceiveDocument(const QSharedPointer<Transaction>& transaction)
+bool TableModel::RemoveRows(const QList<int>& trans_id_list)
 {
-    UpdateRecord(transaction);
+    int min_row {};
+    int trans_id {};
+
+    for (int i = 0; i != trans_list_.size(); ++i) {
+        trans_id = trans_list_.at(i)->id;
+
+        if (trans_id_list.contains(trans_id)) {
+            beginRemoveRows(QModelIndex(), i, i);
+            TransPool::Instance().Recycle(trans_list_.takeAt(i));
+            endRemoveRows();
+
+            if (min_row == 0)
+                min_row = i;
+
+            --i;
+        }
+    }
+
+    AccumulateBalance(trans_list_, min_row, node_rule_);
+    return true;
 }
 
-int TableModel::GetRow(int trans_id) const
+void TableModel::RReplaceTrans(int old_node_id, int new_node_id, const QMultiHash<int, int>& node_trans)
+{
+    if (node_id_ == old_node_id) {
+        RemoveRows(node_trans.values());
+        return;
+    }
+
+    if (node_id_ == new_node_id) {
+        RetrieveTrans(new_node_id, node_trans.values());
+        return;
+    }
+
+    if (node_trans.contains(node_id_)) {
+        auto trans_id_list = node_trans.values(node_id_);
+
+        for (auto& trans : trans_list_) {
+            if (trans_id_list.contains(trans->id))
+                trans->rhs_node = new_node_id;
+        }
+    }
+}
+
+int TableModel::TransRow(int trans_id) const
 {
     int row { 0 };
 
-    for (const auto& transaction : transaction_list_) {
-        if (transaction->id == trans_id) {
+    for (const SPTrans& trans : trans_list_) {
+        if (trans->id == trans_id) {
             return row;
         }
         ++row;
@@ -147,12 +166,48 @@ int TableModel::GetRow(int trans_id) const
     return -1;
 }
 
-int TableModel::EmptyTransfer() const
+void TableModel::UpdateState(Check state)
+{
+    for (auto& trans : trans_list_) {
+        switch (state) {
+        case Check::kAll:
+            trans->state = true;
+            break;
+        case Check::kNone:
+            trans->state = false;
+            break;
+        case Check::kReverse:
+            trans->state = !trans->state;
+            break;
+        default:
+            break;
+        }
+    }
+
+    switch (state) {
+    case Check::kAll:
+        sql_->UpdateState("state", true, state);
+        break;
+    case Check::kNone:
+        sql_->UpdateState("state", false, state);
+        break;
+    case Check::kReverse:
+        sql_->UpdateState("state", true, state);
+        break;
+    default:
+        break;
+    }
+
+    int column { static_cast<int>(TableColumn::kState) };
+    emit dataChanged(index(0, column), index(rowCount() - 1, column));
+}
+
+int TableModel::NodeRow(int node_id) const
 {
     int row { 0 };
 
-    for (const auto& transaction : transaction_list_) {
-        if (transaction->transfer == 0) {
+    for (const SPTrans& trans : trans_list_) {
+        if (trans->rhs_node == node_id) {
             return row;
         }
         ++row;
@@ -160,34 +215,13 @@ int TableModel::EmptyTransfer() const
     return -1;
 }
 
-QSharedPointer<Transaction> TableModel::GetTransaction(const QModelIndex& index) const
+void TableModel::RecycleTrans(QList<SPTrans>& list)
 {
-    if (!index.isValid())
-        return nullptr;
-
-    int row = index.row();
-    if (row < 0 || row >= rowCount())
-        return nullptr;
-
-    return transaction_list_.at(row);
-}
-
-void TableModel::RecycleTransaction(QList<QSharedPointer<Transaction>>& list)
-{
-    for (auto& transaction : list) {
-        TransactionPool::Instance().Recycle(transaction);
+    for (auto& trans : list) {
+        TransPool::Instance().Recycle(trans);
     }
 
     list.clear();
-}
-
-void TableModel::RemoveEmptyTransfer(QList<QSharedPointer<Transaction>>& list)
-{
-    int row = EmptyTransfer();
-    if (row != -1) {
-        int trans_id = list.at(row)->id;
-        RemoveRecord(trans_id);
-    }
 }
 
 QModelIndex TableModel::index(int row, int column, const QModelIndex& parent) const
@@ -204,88 +238,16 @@ QModelIndex TableModel::parent(const QModelIndex& index) const
     return QModelIndex();
 }
 
-void TableModel::CreateTable(int node_id, QList<QSharedPointer<Transaction>>& list)
-{
-    QSqlQuery query_1st(db_);
-    query_1st.setForwardOnly(true);
-    // query.exec("PRAGMA foreign_keys = ON;");
-
-    QSqlQuery query_2nd(db_);
-    query_2nd.setForwardOnly(true);
-    // query_2nd.exec("PRAGMA foreign_keys = ON;");
-
-    const auto part_1st = QString("SELECT id, credit, description, document, status, amount, post_date "
-                                  "FROM %1 "
-                                  "WHERE debit = :node_id")
-                              .arg(table_info_.transaction_table);
-
-    const auto part_2nd = QString("SELECT id, debit, description, document, status, amount, post_date "
-                                  "FROM %1 "
-                                  "WHERE credit = :node_id ")
-                              .arg(table_info_.transaction_table);
-
-    if (!DBTransaction([&]() {
-            query_1st.prepare(part_1st);
-            query_1st.bindValue(":node_id", node_id);
-
-            if (!query_1st.exec()) {
-                qWarning() << "Error in ConstructTable 1st" << query_1st.lastError().text();
-                return false;
-            }
-
-            query_2nd.prepare(part_2nd);
-            query_2nd.bindValue(":node_id", node_id);
-
-            if (!query_2nd.exec()) {
-                qWarning() << "Error in ConstructTable 2nd" << query_2nd.lastError().text();
-                return false;
-            }
-
-            return true;
-        })) {
-        qWarning() << "Failed to create table";
-        return;
-    }
-
-    while (query_1st.next()) {
-        auto transaction = TransactionPool::Instance().Allocate();
-        transaction->id = query_1st.value("id").toInt();
-        transaction->transfer = query_1st.value("credit").toInt();
-        transaction->debit = query_1st.value("amount").toDouble();
-        transaction->description = query_1st.value("description").toString();
-        transaction->document = query_1st.value("document").toString().split(";", Qt::SkipEmptyParts);
-        transaction->post_date = query_1st.value("post_date").toDate();
-        transaction->status = query_1st.value("status").toBool();
-        list.emplace_back(transaction);
-    }
-
-    while (query_2nd.next()) {
-        auto transaction = TransactionPool::Instance().Allocate();
-        transaction->id = query_2nd.value("id").toInt();
-        transaction->transfer = query_2nd.value("debit").toInt();
-        transaction->credit = query_2nd.value("amount").toDouble();
-        transaction->description = query_2nd.value("description").toString();
-        transaction->document = query_2nd.value("document").toString().split(";", Qt::SkipEmptyParts);
-        transaction->post_date = query_2nd.value("post_date").toDate();
-        transaction->status = query_2nd.value("status").toBool();
-        list.emplace_back(transaction);
-    }
-
-    std::sort(list.begin(), list.end(),
-        [](const auto& lhs, const auto& rhs)
-            -> bool { return lhs->post_date < rhs->post_date; });
-}
-
 int TableModel::rowCount(const QModelIndex& parent) const
 {
     Q_UNUSED(parent);
-    return transaction_list_.size();
+    return trans_list_.size();
 }
 
 int TableModel::columnCount(const QModelIndex& parent) const
 {
     Q_UNUSED(parent);
-    return header_.size();
+    return info_->header.size();
 }
 
 QVariant TableModel::data(const QModelIndex& index, int role) const
@@ -293,36 +255,39 @@ QVariant TableModel::data(const QModelIndex& index, int role) const
     if (!index.isValid() || role != Qt::DisplayRole)
         return QVariant();
 
-    int row = index.row();
-    int column = index.column();
+    auto trans { trans_list_.at(index.row()) };
+    const TableColumn kColumn { index.column() };
 
-    if (row >= 0 && row < transaction_list_.size()) {
-        auto transaction = transaction_list_.at(row);
-        switch (column) {
-        case Table::kID:
-            return transaction->id;
-        case Table::kPostDate:
-            return transaction->post_date;
-        case Table::kDescription:
-            return transaction->description;
-        case Table::kTransfer:
-            return transaction->transfer == 0 ? QVariant() : transaction->transfer;
-        case Table::kStatus:
-            return transaction->status;
-        case Table::kDocument:
-            return transaction->document.size() == 0 ? QVariant() : QString::number(transaction->document.size());
-        case Table::kDebit:
-            return transaction->debit == 0 ? QVariant() : QString::number(transaction->debit, 'f', table_info_.decimal);
-        case Table::kCredit:
-            return transaction->credit == 0 ? QVariant() : QString::number(transaction->credit, 'f', table_info_.decimal);
-        case Table::kBalance:
-            return QString::number(transaction->balance, 'f', table_info_.decimal);
-        default:
-            return QVariant();
-        }
+    switch (kColumn) {
+    case TableColumn::kID:
+        return trans->id;
+    case TableColumn::kPostDate:
+        return trans->post_date;
+    case TableColumn::kCode:
+        return trans->code;
+    case TableColumn::kLhsNode:
+        return trans->lhs_node;
+    case TableColumn::kLhsRate:
+        return trans->lhs_rate;
+    case TableColumn::kDescription:
+        return trans->description;
+    case TableColumn::kRhsNode:
+        return trans->rhs_node == 0 ? QVariant() : trans->rhs_node;
+    case TableColumn::kRhsRate:
+        return trans->rhs_rate;
+    case TableColumn::kState:
+        return trans->state;
+    case TableColumn::kDocument:
+        return trans->document.size() == 0 ? QVariant() : QString::number(trans->document.size());
+    case TableColumn::kDebit:
+        return trans->debit == 0 ? QVariant() : trans->debit;
+    case TableColumn::kCredit:
+        return trans->credit == 0 ? QVariant() : trans->credit;
+    case TableColumn::kBalance:
+        return trans->balance;
+    default:
+        return QVariant();
     }
-
-    return QVariant();
 }
 
 bool TableModel::setData(const QModelIndex& index, const QVariant& value, int role)
@@ -330,327 +295,312 @@ bool TableModel::setData(const QModelIndex& index, const QVariant& value, int ro
     if (!index.isValid() || role != Qt::EditRole)
         return false;
 
-    const int kRow = index.row();
-    const int kColumn = index.column();
+    const int kRow { index.row() };
+    const TableColumn kColumn { index.column() };
 
-    if (kRow < 0 || kRow >= transaction_list_.size())
-        return false;
+    auto trans { trans_list_.at(kRow) };
+    int old_rhs_node { trans->rhs_node };
 
-    auto transaction = transaction_list_.at(kRow);
-    int transfer_id = transaction->transfer;
-
-    bool pos_changed { false };
-    bool des_changed { false };
-    bool tra_changed { false };
+    bool nod_changed { false };
     bool deb_changed { false };
     bool cre_changed { false };
+    bool rat_changed { false };
+    bool pos_changed { false };
+    bool cod_changed { false };
+    bool des_changed { false };
     bool sta_changed { false };
 
     switch (kColumn) {
-    case Table::kPostDate:
-        pos_changed = UpdatePostDate(transaction, value.toDate());
+    case TableColumn::kPostDate:
+        pos_changed = UpdatePostDate(trans, value.toString());
         break;
-    case Table::kDescription:
-        des_changed = UpdateDescription(transaction, value.toString());
+    case TableColumn::kCode:
+        cod_changed = UpdateCode(trans, value.toString());
         break;
-    case Table::kTransfer:
-        tra_changed = UpdateTransfer(transaction, value.toInt());
+    case TableColumn::kState:
+        sta_changed = UpdateState(trans, value.toBool());
         break;
-    case Table::kStatus:
-        sta_changed = UpdateStatus(transaction, value.toBool());
+    case TableColumn::kDescription:
+        des_changed = UpdateDescription(trans, value.toString());
         break;
-    case Table::kDebit:
-        deb_changed = UpdateDebit(transaction, value.toDouble());
+    case TableColumn::kLhsRate:
+        rat_changed = UpdateRate(trans, value.toDouble());
         break;
-    case Table::kCredit:
-        cre_changed = UpdateCredit(transaction, value.toDouble());
+    case TableColumn::kRhsNode:
+        nod_changed = UpdateRhsNode(trans, value.toInt());
+        break;
+    case TableColumn::kDebit:
+        deb_changed = UpdateDebit(trans, value.toDouble());
+        break;
+    case TableColumn::kCredit:
+        cre_changed = UpdateCredit(trans, value.toDouble());
         break;
     default:
         return false;
     }
 
+    if (old_rhs_node == 0) {
+        if (nod_changed) {
+            sql_->InsertTrans(trans);
+            AccumulateBalance(trans_list_, kRow, node_rule_);
+            emit SAppendTrans(info_->section, trans);
+            emit SUpdateTotal(QList<int> { trans->rhs_node, node_id_ });
+        }
+
+        emit SResizeColumnToContents(index.column());
+        return true;
+    }
+
+    if (deb_changed || cre_changed || rat_changed || nod_changed)
+        sql_->UpdateTrans(trans);
+
     if (deb_changed || cre_changed) {
-        AccumulateBalance(transaction_list_, kRow, table_info_.node_rule);
-        emit SendUpdate(*transaction);
-        UpdateRecord(transaction);
-        emit SendReCalculate(table_info_.node_id);
-        emit SendReCalculate(transfer_id);
+        AccumulateBalance(trans_list_, kRow, node_rule_);
+        emit SUpdateTotal(QList<int> { old_rhs_node, node_id_ });
+        emit SUpdateTrans(info_->section, trans, TableColumn::kDebit);
     }
 
-    if (tra_changed) {
-        emit SendCopy(table_info_.node_id, *transaction);
-        emit SendRemove(transfer_id, transaction->id);
-        UpdateRecord(transaction);
-        emit SendReCalculate(transaction->transfer);
-        emit SendReCalculate(transfer_id);
+    if (nod_changed) {
+        emit SRemoveTrans(info_->section, old_rhs_node, trans->id);
+        emit SAppendTrans(info_->section, trans);
+        emit SUpdateTotal(QList<int> { old_rhs_node, trans->rhs_node, node_id_ });
     }
 
-    if (des_changed || pos_changed || sta_changed) {
-        emit SendUpdate(*transaction);
-        UpdateRecord(transaction);
+    if (rat_changed) {
+        emit SUpdateTrans(info_->section, trans, TableColumn::kLhsRate);
+        emit SUpdateTotal(QList<int> { trans->rhs_node, node_id_ });
     }
 
-    return true;
-}
-
-bool TableModel::UpdatePostDate(QSharedPointer<Transaction>& transaction, const QDate& value)
-{
-    if (transaction->post_date == value)
-        return false;
-
-    transaction->post_date = value;
-    return true;
-}
-
-bool TableModel::UpdateDescription(QSharedPointer<Transaction>& transaction, const QString& value)
-{
-    if (transaction->description == value) {
-        return false;
+    if (pos_changed) {
+        sql_->UpdateTrans("post_date", value, trans->id);
+        emit SUpdateTrans(info_->section, trans, TableColumn::kPostDate);
     }
 
-    transaction->description = value;
-    return true;
-}
-
-bool TableModel::UpdateTransfer(QSharedPointer<Transaction>& transaction, int new_node_id)
-{
-    if (new_node_id == transaction->transfer || new_node_id == table_info_.node_id)
-        return false;
-
-    transaction->transfer = new_node_id;
-    return true;
-}
-
-bool TableModel::UpdateStatus(QSharedPointer<Transaction>& transaction, bool status)
-{
-    if (transaction->status == status)
-        return false;
-
-    transaction->status = status;
-    return true;
-}
-
-bool TableModel::UpdateDebit(QSharedPointer<Transaction>& transaction, double value)
-{
-    double old_debit = transaction->debit;
-    if (old_debit == value) {
-        return false;
+    if (des_changed) {
+        sql_->UpdateTrans("description", value, trans->id);
+        emit SUpdateTrans(info_->section, trans, TableColumn::kDescription);
     }
 
-    double old_credit = transaction->credit;
-    double amount = qAbs(value - old_credit);
-
-    transaction->debit = (value >= old_credit) ? amount : 0;
-    transaction->credit = (value < old_credit) ? amount : 0;
-
-    return true;
-}
-
-bool TableModel::UpdateCredit(QSharedPointer<Transaction>& transaction, double value)
-{
-    double old_credit = transaction->credit;
-    if (old_credit == value) {
-        return false;
+    if (cod_changed) {
+        sql_->UpdateTrans("code", value, trans->id);
+        emit SUpdateTrans(info_->section, trans, TableColumn::kCode);
     }
 
-    double old_debit = transaction->debit;
-    double amount = qAbs(value - old_debit);
+    if (sta_changed) {
+        sql_->UpdateTrans("state", value, trans->id);
+        emit SUpdateTrans(info_->section, trans, TableColumn::kState);
+    }
 
-    transaction->debit = (value >= old_debit) ? 0 : amount;
-    transaction->credit = (value < old_debit) ? 0 : amount;
+    emit SSearch();
+    emit SResizeColumnToContents(index.column());
 
     return true;
 }
 
-double TableModel::CalculateBalance(bool rule, double debit, double credit)
+bool TableModel::UpdatePostDate(CSPTrans& trans, CString& value)
 {
-    return rule ? credit - debit : debit - credit;
+    if (trans->post_date == value)
+        return false;
+
+    trans->post_date = value;
+    return true;
 }
 
-void TableModel::AccumulateBalance(QList<QSharedPointer<Transaction>>& list, int row, bool rule)
+bool TableModel::UpdateDescription(CSPTrans& trans, CString& value)
 {
-    if (row < 0 || row >= list.size() || list.isEmpty()) {
+    if (trans->description == value)
+        return false;
+
+    trans->description = value;
+    return true;
+}
+
+bool TableModel::UpdateCode(CSPTrans& trans, CString& value)
+{
+    if (trans->code == value)
+        return false;
+
+    trans->code = value;
+    return true;
+}
+
+bool TableModel::UpdateState(CSPTrans& trans, bool value)
+{
+    if (trans->state == value)
+        return false;
+
+    trans->state = value;
+    return true;
+}
+
+bool TableModel::UpdateRhsNode(CSPTrans& trans, int value)
+{
+    if (trans->rhs_node == value)
+        return false;
+
+    trans->rhs_node = value;
+    return true;
+}
+
+bool TableModel::UpdateDebit(CSPTrans& trans, double value)
+{
+    double debit { trans->debit };
+    if (debit == value)
+        return false;
+
+    double credit { trans->credit };
+    double amount { qAbs(value - credit) };
+
+    trans->debit = (value >= credit) ? amount : 0;
+    trans->credit = (value < credit) ? amount : 0;
+
+    return true;
+}
+
+bool TableModel::UpdateCredit(CSPTrans& trans, double value)
+{
+    double credit { trans->credit };
+    if (credit == value)
+        return false;
+
+    double debit { trans->debit };
+    double amount { qAbs(value - debit) };
+
+    trans->debit = (value >= debit) ? 0 : amount;
+    trans->credit = (value < debit) ? 0 : amount;
+
+    return true;
+}
+
+bool TableModel::UpdateRate(CSPTrans& trans, double value)
+{
+    if (trans->lhs_rate == value || value <= 0)
+        return false;
+
+    trans->lhs_rate = value;
+    return true;
+}
+
+double TableModel::CalculateBalance(bool node_rule, double debit, double credit) { return node_rule ? credit - debit : debit - credit; }
+
+void TableModel::AccumulateBalance(const QList<SPTrans>& list, int row, bool node_rule)
+{
+    if (row < 0 || row >= list.size() || list.isEmpty())
         return;
-    }
 
-    double previous_balance = (row > 0) ? list[row - 1]->balance : 0.0;
+    double previous_balance { row >= 1 ? list.at(row - 1)->balance : 0.0 };
 
-    std::accumulate(list.begin() + row, list.end(), previous_balance,
-        [&](double balance, auto& transaction) {
-            transaction->balance = CalculateBalance(rule, transaction->debit, transaction->credit) + balance;
-            return transaction->balance;
-        });
-}
+    std::accumulate(list.begin() + row, list.end(), previous_balance, [&](double balance, SPTrans trans) {
+        trans->balance = CalculateBalance(node_rule, trans->debit, trans->credit) + balance;
+        return trans->balance;
+    });
 
-bool TableModel::UpdateRecord(const QSharedPointer<Transaction>& transaction)
-{
-    int debit_id = transaction->debit == 0 ? transaction->transfer : table_info_.node_id;
-    int credit_id = transaction->debit == 0 ? table_info_.node_id : transaction->transfer;
-    double amount = transaction->debit == 0 ? transaction->credit : transaction->debit;
-    QString post_date = transaction->post_date.toString("yyyy-MM-dd");
-    QString document = transaction->document.join(";");
-
-    QSqlQuery query(db_);
-    // query.exec("PRAGMA foreign_keys = ON;");
-
-    const QString part = QString("UPDATE %1 SET "
-                                 "description = :description, "
-                                 "amount = :amount, "
-                                 "debit = :debit, "
-                                 "credit = :credit, "
-                                 "status = :status, "
-                                 "document = :document, "
-                                 "post_date = :post_date "
-                                 "WHERE id = :id ")
-                             .arg(table_info_.transaction_table);
-
-    query.prepare(part);
-    query.bindValue(":id", transaction->id);
-    query.bindValue(":description", transaction->description);
-    query.bindValue(":amount", amount);
-    query.bindValue(":debit", debit_id);
-    query.bindValue(":credit", credit_id);
-    query.bindValue(":post_date", post_date);
-    query.bindValue(":status", transaction->status);
-    query.bindValue(":document", document);
-
-    if (!query.exec()) {
-        qWarning() << "Failed to update record in transaction table " << query.lastError().text();
-        return false;
-    }
-
-    return true;
+    emit SResizeColumnToContents(static_cast<int>(TableColumn::kBalance));
 }
 
 QVariant TableModel::headerData(int section, Qt::Orientation orientation, int role) const
 {
     if (orientation == Qt::Horizontal && role == Qt::DisplayRole)
-        return header_.at(section);
+        return info_->header.at(section);
 
     return QVariant();
 }
 
 void TableModel::sort(int column, Qt::SortOrder order)
 {
-    emit layoutAboutToBeChanged();
-
-    if (column < 0 || column >= header_.size() - 1) {
-        emit layoutChanged();
+    // ignore balance column
+    if (column < 0 || column >= info_->header.size() - 1)
         return;
-    }
 
-    auto Compare = [column, order](const auto& lhs, const auto& rhs) -> bool {
-        switch (column) {
-        case Table::kPostDate:
+    auto Compare = [column, order](CSPTrans& lhs, CSPTrans& rhs) -> bool {
+        const TableColumn kColumn { column };
+
+        switch (kColumn) {
+        case TableColumn::kPostDate:
             return (order == Qt::AscendingOrder) ? (lhs->post_date < rhs->post_date) : (lhs->post_date > rhs->post_date);
-        case Table::kDescription:
+        case TableColumn::kCode:
+            return (order == Qt::AscendingOrder) ? (lhs->code < rhs->code) : (lhs->code > rhs->code);
+        case TableColumn::kLhsNode:
+            return (order == Qt::AscendingOrder) ? (lhs->lhs_node < rhs->lhs_node) : (lhs->lhs_node > rhs->lhs_node);
+        case TableColumn::kLhsRate:
+            return (order == Qt::AscendingOrder) ? (lhs->lhs_rate < rhs->lhs_rate) : (lhs->lhs_rate > rhs->lhs_rate);
+        case TableColumn::kDescription:
             return (order == Qt::AscendingOrder) ? (lhs->description < rhs->description) : (lhs->description > rhs->description);
-        case Table::kTransfer:
-            return (order == Qt::AscendingOrder) ? (lhs->transfer < rhs->transfer) : (lhs->transfer > rhs->transfer);
-        case Table::kStatus:
-            return (order == Qt::AscendingOrder) ? (lhs->status < rhs->status) : (lhs->status > rhs->status);
-        case Table::kDocument:
+        case TableColumn::kRhsNode:
+            return (order == Qt::AscendingOrder) ? (lhs->rhs_node < rhs->rhs_node) : (lhs->rhs_node > rhs->rhs_node);
+        case TableColumn::kRhsRate:
+            return (order == Qt::AscendingOrder) ? (lhs->rhs_rate < rhs->rhs_rate) : (lhs->rhs_rate > rhs->rhs_rate);
+        case TableColumn::kState:
+            return (order == Qt::AscendingOrder) ? (lhs->state < rhs->state) : (lhs->state > rhs->state);
+        case TableColumn::kDocument:
             return (order == Qt::AscendingOrder) ? (lhs->document.size() < rhs->document.size()) : (lhs->document.size() > rhs->document.size());
-        case Table::kDebit:
+        case TableColumn::kDebit:
             return (order == Qt::AscendingOrder) ? (lhs->debit < rhs->debit) : (lhs->debit > rhs->debit);
-        case Table::kCredit:
+        case TableColumn::kCredit:
             return (order == Qt::AscendingOrder) ? (lhs->credit < rhs->credit) : (lhs->credit > rhs->credit);
         default:
             return false;
         }
     };
 
-    std::sort(transaction_list_.begin(), transaction_list_.end(), Compare);
-    AccumulateBalance(transaction_list_, 0, table_info_.node_rule);
+    emit layoutAboutToBeChanged();
+    std::sort(trans_list_.begin(), trans_list_.end(), Compare);
     emit layoutChanged();
+
+    AccumulateBalance(trans_list_, 0, node_rule_);
 }
 
-bool TableModel::insertRow(int row, const QModelIndex& parent)
+bool TableModel::AppendRow(const QModelIndex& parent)
 {
-    if (row < 0)
-        return false;
+    auto row { trans_list_.size() };
+    auto trans { TransPool::Instance().Allocate() };
 
-    auto transaction = TransactionPool::Instance().Allocate();
+    trans->lhs_node = node_id_;
 
     beginInsertRows(parent, row, row);
-    transaction_list_.insert(row, transaction);
+    trans_list_.emplaceBack(trans);
     endInsertRows();
 
-    AccumulateBalance(transaction_list_, row, table_info_.node_rule);
-    InsertRecord(table_info_.node_id, transaction);
-
     return true;
 }
 
-bool TableModel::InsertRecord(int node_id, QSharedPointer<Transaction>& transaction)
-{
-    QSqlQuery query(db_);
-    const auto part = QString("INSERT INTO %1 (debit) VALUES (:node_id) ")
-                          .arg(table_info_.transaction_table);
-
-    query.prepare(part);
-    query.bindValue(":node_id", node_id);
-    if (!query.exec()) {
-        qWarning() << "Failed to insert record in transaction table" << query.lastError().text();
-        return false;
-    }
-
-    transaction->id = query.lastInsertId().toInt();
-
-    return true;
-}
-
-bool TableModel::removeRow(int row, const QModelIndex& parent)
+bool TableModel::RemoveRow(int row, const QModelIndex& parent)
 {
     if (row < 0)
         return false;
 
-    auto transaction = transaction_list_.at(row);
-    int id = transaction->id;
-    int node_transfer_id = transaction->transfer;
-    int node_id = table_info_.node_id;
+    auto trans { trans_list_.at(row) };
+    int rhs_node_id { trans->rhs_node };
 
     beginRemoveRows(parent, row, row);
-    transaction_list_.removeAt(row);
+    trans_list_.removeAt(row);
     endRemoveRows();
 
-    emit SendRemove(node_transfer_id, id);
+    if (rhs_node_id != 0) {
+        int trans_id { trans->id };
+        emit SRemoveTrans(info_->section, rhs_node_id, trans_id);
+        AccumulateBalance(trans_list_, row, node_rule_);
+        sql_->RemoveTrans(trans_id);
+        emit SUpdateTotal(QList<int> { node_id_, rhs_node_id });
+    }
 
-    if (!transaction_list_.isEmpty())
-        AccumulateBalance(transaction_list_, row, table_info_.node_rule);
-
-    TransactionPool::Instance().Recycle(transaction);
-
-    RemoveRecord(id);
-    emit SendReCalculate(node_id);
-    emit SendReCalculate(node_transfer_id);
+    TransPool::Instance().Recycle(trans);
+    emit SSearch();
     return true;
 }
 
-bool TableModel::RemoveRecord(int trans_id)
+bool TableModel::RetrieveTrans(int node_id, const QList<int>& trans_id_list)
 {
-    QSqlQuery query(db_);
-    const auto query_1st = QString("DELETE FROM %1 WHERE id = :trans_id ").arg(table_info_.transaction_table);
+    auto row { trans_list_.size() };
+    auto sptrans_list { sql_->RetrieveTrans(node_id, trans_id_list) };
 
-    query.prepare(query_1st);
-    query.bindValue(":trans_id", trans_id);
-    if (!query.exec()) {
-        qWarning() << "Failed to remove record in transaction table" << query.lastError().text();
-        return false;
-    }
+    beginInsertRows(QModelIndex(), row, row + sptrans_list.size() - 1);
+    for (auto& trans : sptrans_list)
+        trans_list_.emplace_back(trans);
+    endInsertRows();
 
+    AccumulateBalance(trans_list_, row, node_rule_);
     return true;
-}
-
-bool TableModel::DBTransaction(auto Function)
-{
-    if (db_.transaction() && Function() && db_.commit()) {
-        return true;
-    } else {
-        db_.rollback();
-        qWarning() << "Transaction failed";
-        return false;
-    }
 }
 
 Qt::ItemFlags TableModel::flags(const QModelIndex& index) const
@@ -658,14 +608,14 @@ Qt::ItemFlags TableModel::flags(const QModelIndex& index) const
     if (!index.isValid())
         return Qt::NoItemFlags;
 
-    auto flags = QAbstractItemModel::flags(index);
-    const int kColumn = index.column();
+    auto flags { QAbstractItemModel::flags(index) };
+    const TableColumn kColumn { index.column() };
 
     switch (kColumn) {
-    case Table::kID:
+    case TableColumn::kID:
         flags &= ~Qt::ItemIsEditable;
         break;
-    case Table::kBalance:
+    case TableColumn::kBalance:
         flags &= ~Qt::ItemIsEditable;
         break;
     default:

@@ -1,48 +1,46 @@
 #ifndef TRANSACTION_H
 #define TRANSACTION_H
 
-#include <QDate>
-#include <QString>
-
-QT_BEGIN_NAMESPACE
-namespace Table {
-enum Column {
-    kID,
-    kPostDate,
-    kDescription,
-    kTransfer,
-    kStatus,
-    kDocument,
-    kDebit,
-    kCredit,
-    kBalance,
-};
-}
-QT_END_NAMESPACE
+#include <QStringList>
 
 struct Transaction {
-    int id { 0 };
-    QDate post_date { QDate::currentDate() };
+    int id {};
+    QString post_date {};
+    QString code {};
+    int lhs_node {};
+    double lhs_rate { 1.0 };
     QString description {};
-    int transfer { 0 };
-    bool status { false };
+    int rhs_node {};
+    double rhs_rate { 1.0 };
+    bool state { false };
     QStringList document {};
-    double debit { 0.0 };
-    double credit { 0.0 };
-    double balance { 0.0 };
+    double debit {};
+    double credit {};
+    double balance {};
 
-    void ResetToDefault()
+    Transaction() = default;
+
+    Transaction(const Transaction&) = delete;
+    Transaction& operator=(const Transaction&) = delete;
+    Transaction(Transaction&&) = delete;
+    Transaction& operator=(Transaction&&) = delete;
+
+    void Reset()
     {
         id = 0;
-        post_date = QDate::currentDate();
-        description.clear();
-        transfer = 0;
-        status = false;
-        document.clear();
+        post_date.clear();
+        lhs_node = 0;
+        lhs_rate = 1.0;
         debit = 0.0;
         credit = 0.0;
+        rhs_node = 0;
+        rhs_rate = 1.0;
+        state = false;
+        description.clear();
+        code.clear();
+        document.clear();
         balance = 0.0;
-    };
+    }
 };
 
 #endif // TRANSACTION_H
